@@ -7,13 +7,16 @@ use crate::model::{
 use crate::utils::{chw_vec_to_image, float_vec_to_image};
 
 use burn::{
-    data::dataloader::{self, DataLoaderBuilder},
+    data::dataloader::DataLoaderBuilder,
+    grad_clipping::{GradientClipping, GradientClippingConfig},
+    module::list_param_ids,
     nn::loss::{BinaryCrossEntropyLossConfig, Reduction::Mean},
     optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     record::CompactRecorder,
     tensor::Distribution,
     tensor::backend::AutodiffBackend,
+    tensor::*,
     train::{
         LearnerBuilder, RegressionOutput, TrainOutput, TrainStep, ValidStep,
         metric::{AccuracyMetric, LossMetric},
@@ -26,7 +29,7 @@ pub struct TrainingConfig {
     pub optimizer_g: AdamConfig,
     pub optimizer_d: AdamConfig,
 
-    #[config(default = 40)]
+    #[config(default = 540)]
     pub num_epochs: usize,
 
     #[config(default = 32)]
@@ -38,8 +41,11 @@ pub struct TrainingConfig {
     #[config(default = 42)]
     pub seed: u64,
 
-    #[config(default = 1.0e-4)]
-    pub learning_rate: f64,
+    #[config(default = 2.0e-4)]
+    pub gen_learning_rate: f64,
+
+    #[config(default = 4.0e-4)]
+    pub disc_learning_rate: f64,
 }
 
 fn create_artifact_dir(artifact_dir: &str) {
@@ -68,10 +74,21 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
     let mut discriminator = config.model.discriminator.init(&device);
 
     // Initialize optimizers
-    let mut optim_g = config.optimizer_g.init();
-    let mut optim_d = config.optimizer_d.init();
+    let gradient_clipping_g = GradientClippingConfig::init(&GradientClippingConfig::Norm(1.0));
+    let gradient_clipping_d = GradientClippingConfig::init(&GradientClippingConfig::Norm(1.0));
 
-    let loss_criterion = BinaryCrossEntropyLossConfig::new().init(&device);
+    let mut optim_g = config
+        .optimizer_g
+        .with_beta_1(0.5)
+        .with_beta_2(0.999)
+        .init()
+        .with_grad_clipping(gradient_clipping_g);
+    let mut optim_d = config
+        .optimizer_d
+        .with_beta_1(0.5)
+        .with_beta_2(0.999)
+        .init()
+        .with_grad_clipping(gradient_clipping_d);
 
     for epoch in 1..=config.num_epochs {
         for (iteration, batch) in dataloader_train.iter().enumerate() {
@@ -81,13 +98,15 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
             // --- 1. Train the Discriminator --- //
             // Create labels for real (1) and fake (0) images
             let real_labels = Tensor::<B, 1, Int>::ones([batch_size], &device);
+            let real_labels = smooth_positive_labels(real_labels);
             let fake_labels = Tensor::<B, 1, Int>::zeros([batch_size], &device);
-
+            let fake_labels = smooth_negative_labels(fake_labels);
             // -- Loss on real images --
             let real_output = discriminator.forward(real_images);
             let real_output = real_output.reshape([batch_size]);
 
-            let loss_real = loss_criterion.forward(real_output, real_labels.clone());
+            let loss_real =
+                binary_cross_entropy_with_continuous_targets(real_output, real_labels.clone());
 
             // -- Loss on fake images --
             let noise = Tensor::<B, 2>::random(
@@ -99,14 +118,16 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
 
             let fake_output = discriminator.forward(fake_images.detach());
             let fake_output = fake_output.reshape([batch_size]); // Ensure shape matches labels
-            let loss_fake = loss_criterion.forward(fake_output, fake_labels.clone());
+            let loss_fake =
+                binary_cross_entropy_with_continuous_targets(fake_output, fake_labels.clone());
 
             let loss_d = (loss_real + loss_fake) / 2;
 
             let grads_d = loss_d.backward();
-            let grads_d = GradientsParams::from_grads(grads_d, &discriminator);
 
-            discriminator = optim_d.step(config.learning_rate, discriminator, grads_d);
+            let mut grads_d = GradientsParams::from_grads(grads_d, &discriminator);
+
+            discriminator = optim_d.step(config.disc_learning_rate, discriminator, grads_d);
 
             // --- 2. Train the Generator --- //
             // Generate a new batch of fake images
@@ -119,11 +140,12 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
             let output_for_g = discriminator.forward(fake_images_for_g);
             let output_for_g = output_for_g.reshape([batch_size]);
 
-            let loss_g = loss_criterion.forward(output_for_g, real_labels.clone());
+            let loss_g =
+                binary_cross_entropy_with_continuous_targets(output_for_g, real_labels.clone());
 
             let grads_g = loss_g.backward();
             let grads_g = GradientsParams::from_grads(grads_g, &generator);
-            generator = optim_g.step(config.learning_rate, generator, grads_g);
+            generator = optim_g.step(config.gen_learning_rate, generator, grads_g);
 
             if iteration % 100 == 0 {
                 println!(
@@ -165,4 +187,42 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
                 .expect("Failed to save sample image");
         }
     }
+}
+
+// -- Label Smoothing Functions --
+// Smooth labels for the discriminator to improve training stability
+/// Smooth positive labels: range 0.8 - 1.2
+pub fn smooth_positive_labels<B: Backend>(
+    labels: Tensor<B, 1, burn::tensor::Int>,
+) -> Tensor<B, 1, burn::tensor::Float> {
+    let labels = labels.float();
+    let shape = labels.dims();
+    let noise =
+        Tensor::<B, 1>::random(shape, Distribution::Uniform(0.0, 1.0), &labels.device()) * 0.4;
+    labels - 0.2 + noise
+}
+
+/// Smooth negative labels: range 0.0 - 0.3
+pub fn smooth_negative_labels<B: Backend>(
+    labels: Tensor<B, 1, burn::tensor::Int>,
+) -> Tensor<B, 1, burn::tensor::Float> {
+    let labels = labels.float();
+    let shape = labels.dims();
+    let noise =
+        Tensor::<B, 1>::random(shape, Distribution::Uniform(0.0, 1.0), &labels.device()) * 0.3;
+    labels + noise
+}
+
+// Manual BCE implementation
+fn binary_cross_entropy_with_continuous_targets<B: Backend>(
+    predictions: Tensor<B, 1>,
+    targets: Tensor<B, 1>,
+) -> Tensor<B, 1> {
+    let eps = 1e-7; //to avoid log(0)
+    let predictions = predictions.clamp(eps, 1.0 - eps);
+
+    let loss = targets.clone() * predictions.clone().log()
+        + (Tensor::<B, 1>::ones_like(&predictions) - targets)
+            * (Tensor::<B, 1>::ones_like(&predictions) - predictions).log();
+    -loss.mean()
 }
