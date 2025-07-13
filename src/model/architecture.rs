@@ -11,7 +11,7 @@ use burn::{
 #[derive(Module, Debug)]
 pub struct Model<B: Backend> {
     pub generator: GeneratorModel<B>,
-    pub discriminator: DiscriminatorModel<B>,
+    pub discriminator: EnDiscriminatorModel<B>,
 }
 
 #[derive(Module, Debug)]
@@ -31,7 +31,7 @@ pub struct GeneratorModel<B: Backend> {
 
 #[derive(Config, Debug)]
 pub struct GeneratorModelConfig {
-    #[config(default = "0.5")]
+    #[config(default = "0.7")]
     dropout: f64,
 }
 
@@ -58,6 +58,33 @@ pub struct DiscriminatorModel<B: Backend> {
 pub struct DiscriminatorConfig {
     #[config(default = "0.5")]
     dropout: f64,
+    #[config(default = "0.2")]
+    leaky_relu_slope: f64,
+}
+
+#[derive(Module, Debug)]
+pub struct EnDiscriminatorModel<B: Backend> {
+    // Encoder
+    conv1: Conv2d<B>,
+    conv2: Conv2d<B>,
+    conv3: Conv2d<B>,
+    bn1: BatchNorm<B, 2>,
+    bn2: BatchNorm<B, 2>,
+    bn3: BatchNorm<B, 2>,
+
+    // Decoder
+    deconv1: ConvTranspose2d<B>,
+    deconv2: ConvTranspose2d<B>,
+    deconv3: ConvTranspose2d<B>,
+    dbn1: BatchNorm<B, 2>,
+    dbn2: BatchNorm<B, 2>,
+
+    activation: LeakyRelu,
+    activation_final: Tanh,
+}
+
+#[derive(Config, Debug)]
+pub struct EnDiscriminatorConfig {
     #[config(default = "0.2")]
     leaky_relu_slope: f64,
 }
@@ -128,10 +155,56 @@ impl DiscriminatorConfig {
     }
 }
 
+impl EnDiscriminatorConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> EnDiscriminatorModel<B> {
+        EnDiscriminatorModel {
+            // Encoder
+            conv1: Conv2dConfig::new([3, 64], [4, 4])
+                .with_stride([2, 2])
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
+                .init(device), // 64 -> 32
+            conv2: Conv2dConfig::new([64, 128], [4, 4])
+                .with_stride([2, 2])
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
+                .init(device), // 32 -> 16
+            conv3: Conv2dConfig::new([128, 256], [4, 4])
+                .with_stride([2, 2])
+                .with_padding(PaddingConfig2d::Explicit(1, 1))
+                .init(device), // 16 -> 8
+
+            bn1: BatchNormConfig::new(64).init(device),
+            bn2: BatchNormConfig::new(128).init(device),
+            bn3: BatchNormConfig::new(256).init(device),
+
+            // Decoder
+            deconv1: ConvTranspose2dConfig::new([256, 128], [4, 4])
+                .with_stride([2, 2])
+                .with_padding([1, 1])
+                .init(device), // 8 -> 16
+            deconv2: ConvTranspose2dConfig::new([128, 64], [4, 4])
+                .with_stride([2, 2])
+                .with_padding([1, 1])
+                .init(device), // 16 -> 32
+            deconv3: ConvTranspose2dConfig::new([64, 3], [4, 4])
+                .with_stride([2, 2])
+                .with_padding([1, 1])
+                .init(device), // 32 -> 64
+
+            dbn1: BatchNormConfig::new(128).init(device),
+            dbn2: BatchNormConfig::new(64).init(device),
+
+            activation: LeakyReluConfig::new()
+                .with_negative_slope(self.leaky_relu_slope)
+                .init(),
+            activation_final: Tanh::new(),
+        }
+    }
+}
+
 #[derive(Config, Debug)]
 pub struct ModelConfig {
     pub generator: GeneratorModelConfig,
-    pub discriminator: DiscriminatorConfig,
+    pub discriminator: EnDiscriminatorConfig,
 }
 
 impl ModelConfig {
@@ -140,24 +213,6 @@ impl ModelConfig {
             generator: self.generator.init(device),
             discriminator: self.discriminator.init(device),
         }
-    }
-}
-
-impl<B: Backend> Model<B> {
-    pub fn new(
-        generator_config: GeneratorModelConfig,
-        discriminator_config: DiscriminatorConfig,
-        device: &B::Device,
-    ) -> Self {
-        Model {
-            generator: generator_config.init(device),
-            discriminator: discriminator_config.init(device),
-        }
-    }
-    pub fn forward(&self, input: Tensor<B, 2>) -> (Tensor<B, 4>, Tensor<B, 2>) {
-        let generated = self.generator.forward(input);
-        let discriminator_output = self.discriminator.forward(generated.clone());
-        (generated, discriminator_output)
     }
 }
 
@@ -211,5 +266,36 @@ impl<B: Backend> DiscriminatorModel<B> {
         x = self.dropout.forward(x);
         x = self.linear2.forward(x);
         self.activation_final.forward(x)
+    }
+}
+
+impl<B: Backend> EnDiscriminatorModel<B> {
+    pub fn forward(&self, input: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        // Encoder
+        let mut x = self.conv1.forward(input.clone());
+        x = self.bn1.forward(x);
+        x = self.activation.forward(x);
+
+        x = self.conv2.forward(x);
+        x = self.bn2.forward(x);
+        x = self.activation.forward(x);
+
+        x = self.conv3.forward(x);
+        x = self.bn3.forward(x);
+        let embedding = self.activation.forward(x);
+
+        // Decoder
+        let mut x = self.deconv1.forward(embedding.clone());
+        x = self.dbn1.forward(x);
+        x = self.activation.forward(x);
+
+        x = self.deconv2.forward(x);
+        x = self.dbn2.forward(x);
+        x = self.activation.forward(x);
+
+        x = self.deconv3.forward(x);
+        let reconstruction = self.activation_final.forward(x);
+
+        (reconstruction, embedding)
     }
 }

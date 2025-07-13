@@ -10,7 +10,7 @@ use burn::{
     data::dataloader::DataLoaderBuilder,
     grad_clipping::{GradientClipping, GradientClippingConfig},
     module::list_param_ids,
-    nn::loss::{BinaryCrossEntropyLossConfig, Reduction::Mean},
+    nn::loss::{MseLoss, Reduction::Mean},
     optim::{AdamConfig, GradientsParams, Optimizer},
     prelude::*,
     record::CompactRecorder,
@@ -41,11 +41,17 @@ pub struct TrainingConfig {
     #[config(default = 42)]
     pub seed: u64,
 
-    #[config(default = 1.0e-4)]
+    #[config(default = 2.0e-4)]
     pub gen_learning_rate: f64,
 
-    #[config(default = 2.0e-4)]
+    #[config(default = 1.0e-4)]
     pub disc_learning_rate: f64,
+
+    #[config(default = 50.0)]
+    pub margin: f64,
+
+    #[config(default = 0.05)]
+    pub pt_weight: f64,
 }
 
 fn create_artifact_dir(artifact_dir: &str) {
@@ -74,7 +80,7 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
     let mut discriminator = config.model.discriminator.init(&device);
 
     // Initialize optimizers
-    let gradient_clipping_g = GradientClippingConfig::init(&GradientClippingConfig::Norm(1.0));
+    let gradient_clipping_g = GradientClippingConfig::init(&GradientClippingConfig::Norm(0.5));
     let gradient_clipping_d = GradientClippingConfig::init(&GradientClippingConfig::Norm(1.0));
 
     let mut optim_g = config
@@ -96,32 +102,33 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
             let batch_size = real_images.dims()[0];
 
             // --- 1. Train the Discriminator --- //
-            // Create labels for real (1) and fake (0) images
-            let real_labels = Tensor::<B, 1, Int>::ones([batch_size], &device);
-            let real_labels = smooth_positive_labels(real_labels);
-            let fake_labels = Tensor::<B, 1, Int>::zeros([batch_size], &device);
-            let fake_labels = smooth_negative_labels(fake_labels);
-            // -- Loss on real images --
-            let real_output = discriminator.forward(real_images);
-            let real_output = real_output.reshape([batch_size]);
-
-            let loss_real =
-                binary_cross_entropy_with_continuous_targets(real_output, real_labels.clone());
-
-            // -- Loss on fake images --
             let noise = Tensor::<B, 2>::random(
                 [batch_size, LATENT_DIM],
                 Distribution::Normal(0.0, 1.0),
                 &device,
             );
-            let fake_images = generator.forward(noise);
 
-            let fake_output = discriminator.forward(fake_images.detach());
-            let fake_output = fake_output.reshape([batch_size]); // Ensure shape matches labels
-            let loss_fake =
-                binary_cross_entropy_with_continuous_targets(fake_output, fake_labels.clone());
+            // Detach the fake images from the generator's computation graph
+            let fake_images_detached = generator.forward(noise.clone()).detach();
 
-            let loss_d = (loss_real + loss_fake) / 2;
+            let (reconstructed_fake, _) = discriminator.forward(fake_images_detached.clone());
+            let (reconstructed_real, _) = discriminator.forward(real_images.clone());
+
+            // Loss for real images (aims for low reconstruction error)
+            let loss_d_real = MseLoss::new().forward(reconstructed_real, real_images.clone(), Mean);
+
+            // Loss for fake images (aims for high reconstruction error)
+            let loss_d_fake =
+                MseLoss::new().forward(reconstructed_fake, fake_images_detached, Mean);
+
+            let margin_tensor =
+                Tensor::<B, 1>::from_data(TensorData::from([config.margin as f32]), &device);
+
+            // Hinge loss: punish the discriminator if the reconstruction error for fake images is below the margin
+            let loss_d_hinge = (margin_tensor - loss_d_fake).clamp_min(0.0);
+
+            // Total discriminator loss
+            let loss_d = loss_d_real + loss_d_hinge;
 
             let grads_d = loss_d.backward();
 
@@ -130,18 +137,16 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
             discriminator = optim_d.step(config.disc_learning_rate, discriminator, grads_d);
 
             // --- 2. Train the Generator --- //
-            // Generate a new batch of fake images
-            let noise = Tensor::<B, 2>::random(
-                [batch_size, LATENT_DIM],
-                Distribution::Normal(0.0, 1.0),
-                &device,
-            );
-            let fake_images_for_g = generator.forward(noise);
-            let output_for_g = discriminator.forward(fake_images_for_g);
-            let output_for_g = output_for_g.reshape([batch_size]);
+            let fake_images = generator.forward(noise);
 
-            let loss_g =
-                binary_cross_entropy_with_continuous_targets(output_for_g, real_labels.clone());
+            let (reconstructed_fake, fake_embeddings) = discriminator.forward(fake_images.clone());
+
+            let loss_g_reconstruct = MseLoss::new().forward(reconstructed_fake, fake_images, Mean);
+
+            let loss_pt = pulling_away_loss(fake_embeddings);
+
+            // The generator's total loss
+            let loss_g = loss_g_reconstruct + (loss_pt.clone() * config.pt_weight as f32);
 
             let grads_g = loss_g.backward();
             let grads_g = GradientsParams::from_grads(grads_g, &generator);
@@ -149,12 +154,13 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
 
             if iteration % 100 == 0 {
                 println!(
-                    "[Epoch {}/{} Iter {}] D Loss: {:.4}, G Loss: {:.4}",
+                    "[Epoch {}/{} Iter {}] D Loss: {:.4}, G Loss: {:.4}, PT Loss: {:.4}",
                     epoch,
                     config.num_epochs,
                     iteration,
                     loss_d.clone().into_scalar(),
-                    loss_g.clone().into_scalar()
+                    loss_g.clone().into_scalar(),
+                    loss_pt.clone().into_scalar(),
                 );
             }
         }
@@ -187,6 +193,27 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
                 .expect("Failed to save sample image");
         }
     }
+}
+
+/// Pulling-away loss for EBGAN
+fn pulling_away_loss<B: AutodiffBackend>(embeddings: Tensor<B, 4>) -> Tensor<B, 1> {
+    let [batch_size, d1, d2, d3] = embeddings.dims();
+    let embedding_len = d1 * d2 * d3;
+    let embeddings_flat = embeddings.reshape([batch_size, embedding_len]);
+
+    // Normalize embeddings
+    let norm = embeddings_flat.clone().powf_scalar(2.0).sum_dim(1).sqrt();
+    let norm = norm.reshape([batch_size, 1]);
+    let normalized_embeddings = embeddings_flat.div(norm);
+
+    // Calculate cosine similarity matrix
+    let similarity = normalized_embeddings
+        .clone()
+        .matmul(normalized_embeddings.transpose());
+
+    // Remove self-similarity
+    let loss = similarity.powf_scalar(2.0).sum() - batch_size as f32;
+    loss / (batch_size * (batch_size - 1)) as f32
 }
 
 // -- Label Smoothing Functions --

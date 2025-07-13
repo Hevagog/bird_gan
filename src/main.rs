@@ -5,7 +5,7 @@ use burn::{
     optim::AdamConfig,
 };
 
-use model::architecture::{DiscriminatorConfig, GeneratorModelConfig, ModelConfig};
+use model::architecture::{EnDiscriminatorConfig, GeneratorModelConfig, ModelConfig};
 
 fn main() {
     type MyBackend = Cuda<f32, i32>;
@@ -17,7 +17,7 @@ fn main() {
     model::training::train::<MyAutodiffBackend>(
         artifact_dir,
         model::training::TrainingConfig::new(
-            ModelConfig::new(GeneratorModelConfig::new(), DiscriminatorConfig::new()),
+            ModelConfig::new(GeneratorModelConfig::new(), EnDiscriminatorConfig::new()),
             AdamConfig::new(),
             AdamConfig::new(),
         ),
