@@ -1,5 +1,7 @@
 use crate::model::constants::CHANNELS;
 
+use imageproc::filter::gaussian_blur_f32;
+
 pub fn float_vec_to_image(
     data: &[f32],
     height: usize,
@@ -34,7 +36,12 @@ pub fn float_vec_to_image(
 }
 
 /// Converts a channel-first [C, H, W] float slice to an RGB image.
-pub fn chw_vec_to_image(data: &[f32], height: usize, width: usize) -> Option<image::DynamicImage> {
+pub fn chw_vec_to_image(
+    data: &[f32],
+    height: usize,
+    width: usize,
+    smooth: bool,
+) -> Option<image::DynamicImage> {
     let mut raw_pixels = Vec::with_capacity(height * width * 3);
     for i in 0..(height * width) {
         let r = (data[i] + 1.0) * 127.5;
@@ -49,5 +56,10 @@ pub fn chw_vec_to_image(data: &[f32], height: usize, width: usize) -> Option<ima
         height as u32,
         raw_pixels,
     )?;
-    Some(image::DynamicImage::ImageRgb8(img_buf))
+    if !smooth {
+        return Some(image::DynamicImage::ImageRgb8(img_buf));
+    } else {
+        let smoothed = gaussian_blur_f32(&img_buf, 0.7);
+        Some(image::DynamicImage::ImageRgb8(smoothed))
+    }
 }

@@ -41,10 +41,10 @@ pub struct TrainingConfig {
     #[config(default = 42)]
     pub seed: u64,
 
-    #[config(default = 2.0e-4)]
+    #[config(default = 1.0e-4)]
     pub gen_learning_rate: f64,
 
-    #[config(default = 4.0e-4)]
+    #[config(default = 2.0e-4)]
     pub disc_learning_rate: f64,
 }
 
@@ -125,7 +125,7 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
 
             let grads_d = loss_d.backward();
 
-            let mut grads_d = GradientsParams::from_grads(grads_d, &discriminator);
+            let grads_d = GradientsParams::from_grads(grads_d, &discriminator);
 
             discriminator = optim_d.step(config.disc_learning_rate, discriminator, grads_d);
 
@@ -182,7 +182,7 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
 
         let image_data: Vec<f32> = sample_image_tensor.into_data().to_vec().unwrap();
 
-        if let Some(img) = chw_vec_to_image(&image_data, HEIGHT, WIDTH) {
+        if let Some(img) = chw_vec_to_image(&image_data, HEIGHT, WIDTH, true) {
             img.save(format!("train_generated/sample-epoch-{}.png", epoch))
                 .expect("Failed to save sample image");
         }

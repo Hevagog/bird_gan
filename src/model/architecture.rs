@@ -27,7 +27,6 @@ pub struct GeneratorModel<B: Backend> {
     linear1: Linear<B>,
     activation: Relu,
     activation2: Tanh,
-    dropout: Dropout,
 }
 
 #[derive(Config, Debug)]
@@ -89,7 +88,6 @@ impl GeneratorModelConfig {
             bn4: BatchNormConfig::new(64).init(device),
             activation: Relu::new(),
             activation2: Tanh::new(),
-            dropout: DropoutConfig::new(self.dropout).init(),
         }
     }
 }
@@ -173,11 +171,9 @@ impl<B: Backend> GeneratorModel<B> {
         x = self.conv1.forward(x);
         x = self.bn2.forward(x);
         x = self.activation.forward(x);
-        x = self.dropout.forward(x);
         x = self.conv2.forward(x);
         x = self.bn3.forward(x);
         x = self.activation.forward(x);
-        x = self.dropout.forward(x);
         x = self.conv3.forward(x);
         x = self.bn4.forward(x);
         x = self.activation.forward(x);
