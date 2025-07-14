@@ -99,6 +99,26 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
         .init()
         .with_grad_clipping(gradient_clipping_d);
 
+    // --- Discriminator Warm-up Phase ---
+    println!("Starting discriminator warm-up...");
+    for (iteration, batch) in dataloader_train.iter().take(200).enumerate() {
+        let real_images = batch.images.to_device(&device);
+        let (reconstructed_real, _) = discriminator.forward(real_images.clone());
+        let loss_d_real = MseLoss::new().forward(reconstructed_real, real_images, Mean);
+        let grads_d = loss_d_real.backward();
+        let grads_d = GradientsParams::from_grads(grads_d, &discriminator);
+        discriminator = optim_d.step(config.disc_learning_rate, discriminator, grads_d);
+
+        if iteration % 40 == 0 {
+            println!(
+                "[Warm-up Iter {}] D Real Loss: {:.4}",
+                iteration,
+                loss_d_real.into_scalar()
+            );
+        }
+    }
+    println!("Discriminator warm-up finished.");
+
     for epoch in 1..=config.num_epochs {
         for (iteration, batch) in dataloader_train.iter().enumerate() {
             let real_images = batch.images.to_device(&device);

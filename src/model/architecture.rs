@@ -72,17 +72,20 @@ impl GeneratorModelConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> GeneratorModel<B> {
         GeneratorModel {
             linear1: LinearConfig::new(LATENT_DIM, 512 * 4 * 4).init(device),
-            conv1: ConvTranspose2dConfig::new([512, 256], [4, 4])
+            conv1: ConvTranspose2dConfig::new([512, 256], [3, 3])
                 .with_stride([2, 2])
                 .with_padding([1, 1])
+                .with_padding_out([1, 1])
                 .init(device),
-            conv2: ConvTranspose2dConfig::new([256, 128], [4, 4])
+            conv2: ConvTranspose2dConfig::new([256, 128], [3, 3])
                 .with_stride([2, 2])
                 .with_padding([1, 1])
+                .with_padding_out([1, 1])
                 .init(device),
-            conv3: ConvTranspose2dConfig::new([128, 64], [4, 4])
+            conv3: ConvTranspose2dConfig::new([128, 64], [3, 3])
                 .with_stride([2, 2])
                 .with_padding([1, 1])
+                .with_padding_out([1, 1])
                 .init(device),
             conv4: ConvTranspose2dConfig::new([64, 3], [4, 4])
                 .with_stride([2, 2])
@@ -92,8 +95,8 @@ impl GeneratorModelConfig {
             bn2: BatchNormConfig::new(256).init(device),
             bn3: BatchNormConfig::new(128).init(device),
             bn4: BatchNormConfig::new(64).init(device),
-            activation: Relu::new(),
-            activation2: Tanh::new(),
+            activation: Relu,
+            activation2: Tanh,
         }
     }
 }
