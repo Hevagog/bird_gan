@@ -29,11 +29,12 @@ pub struct GeneratorModel<B: Backend> {
     linear1: Linear<B>,
     activation: Relu,
     activation2: Tanh,
+    dropout: Dropout,
 }
 
 #[derive(Config, Debug)]
 pub struct GeneratorModelConfig {
-    #[config(default = "0.7")]
+    #[config(default = "0.25")]
     dropout: f64,
 }
 
@@ -48,8 +49,10 @@ pub struct EnDiscriminatorModel<B: Backend> {
     bn2: BatchNorm<B, 2>,
     bn3: BatchNorm<B, 2>,
     bn4: BatchNorm<B, 2>,
+    encoder_out: Linear<B>, // New bottleneck layer
 
     // Decoder
+    decoder_in: Linear<B>, // New layer to project vector back to map
     deconv1: ConvTranspose2d<B>,
     deconv2: ConvTranspose2d<B>,
     deconv3: ConvTranspose2d<B>,
@@ -60,12 +63,15 @@ pub struct EnDiscriminatorModel<B: Backend> {
 
     activation: LeakyRelu,
     activation_final: Tanh,
+    dropout: Dropout,
 }
 
 #[derive(Config, Debug)]
 pub struct EnDiscriminatorConfig {
     #[config(default = "0.2")]
     leaky_relu_slope: f64,
+    #[config(default = "0.3")]
+    dropout: f64,
 }
 
 impl GeneratorModelConfig {
@@ -87,9 +93,10 @@ impl GeneratorModelConfig {
                 .with_padding([1, 1])
                 .with_padding_out([1, 1])
                 .init(device),
-            conv4: ConvTranspose2dConfig::new([64, 3], [4, 4])
+            conv4: ConvTranspose2dConfig::new([64, 3], [3, 3])
                 .with_stride([2, 2])
                 .with_padding([1, 1])
+                .with_padding_out([1, 1])
                 .init(device),
             bn1: BatchNormConfig::new(512).init(device),
             bn2: BatchNormConfig::new(256).init(device),
@@ -97,12 +104,15 @@ impl GeneratorModelConfig {
             bn4: BatchNormConfig::new(64).init(device),
             activation: Relu,
             activation2: Tanh,
+            dropout: DropoutConfig::new(self.dropout).init(),
         }
     }
 }
 
 impl EnDiscriminatorConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> EnDiscriminatorModel<B> {
+        let embedding_dim = 1024; // Define a size for the bottleneck vector
+
         EnDiscriminatorModel {
             // Encoder
             conv1: Conv2dConfig::new([3, 64], [4, 4])
@@ -126,8 +136,10 @@ impl EnDiscriminatorConfig {
             bn2: BatchNormConfig::new(128).init(device),
             bn3: BatchNormConfig::new(256).init(device),
             bn4: BatchNormConfig::new(512).init(device),
+            encoder_out: LinearConfig::new(512 * 4 * 4, embedding_dim).init(device),
 
             // Decoder
+            decoder_in: LinearConfig::new(embedding_dim, 512 * 4 * 4).init(device),
             deconv1: ConvTranspose2dConfig::new([512, 256], [4, 4])
                 .with_stride([2, 2])
                 .with_padding([1, 1])
@@ -153,6 +165,7 @@ impl EnDiscriminatorConfig {
                 .with_negative_slope(self.leaky_relu_slope)
                 .init(),
             activation_final: Tanh::new(),
+            dropout: DropoutConfig::new(self.dropout).init(),
         }
     }
 }
@@ -179,12 +192,15 @@ impl<B: Backend> GeneratorModel<B> {
         let mut x = x.reshape([-1, 512, 4, 4]);
         x = self.bn1.forward(x);
         x = self.activation.forward(x);
+        x = self.dropout.forward(x);
         x = self.conv1.forward(x);
         x = self.bn2.forward(x);
         x = self.activation.forward(x);
+        x = self.dropout.forward(x);
         x = self.conv2.forward(x);
         x = self.bn3.forward(x);
         x = self.activation.forward(x);
+        x = self.dropout.forward(x);
         x = self.conv3.forward(x);
         x = self.bn4.forward(x);
         x = self.activation.forward(x);
@@ -194,26 +210,34 @@ impl<B: Backend> GeneratorModel<B> {
 }
 
 impl<B: Backend> EnDiscriminatorModel<B> {
-    pub fn forward(&self, input: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    pub fn forward(&self, input: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 2>) {
         // Encoder
         let mut x = self.conv1.forward(input.clone());
         x = self.bn1.forward(x);
         x = self.activation.forward(x);
+        x = self.dropout.forward(x);
 
         x = self.conv2.forward(x);
         x = self.bn2.forward(x);
         x = self.activation.forward(x);
+        x = self.dropout.forward(x);
 
         x = self.conv3.forward(x);
         x = self.bn3.forward(x);
         x = self.activation.forward(x);
+        x = self.dropout.forward(x);
 
         x = self.conv4.forward(x);
         x = self.bn4.forward(x);
-        let embedding = self.activation.forward(x);
+        x = self.activation.forward(x);
+
+        let x_flat = x.reshape([-1i32, 512 * 4 * 4]);
+        let embedding = self.encoder_out.forward(x_flat);
 
         // Decoder
-        let mut x = self.deconv1.forward(embedding.clone());
+        let x = self.decoder_in.forward(embedding.clone());
+        let mut x = x.reshape([-1, 512, 4, 4]);
+        x = self.deconv1.forward(x);
         x = self.dbn1.forward(x);
         x = self.activation.forward(x);
 
