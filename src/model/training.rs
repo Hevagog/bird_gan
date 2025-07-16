@@ -41,19 +41,19 @@ pub struct TrainingConfig {
     #[config(default = 42)]
     pub seed: u64,
 
-    #[config(default = 8e-5)]
+    #[config(default = 2e-5)]
     pub gen_learning_rate: f64,
 
     #[config(default = 2e-5)]
     pub disc_learning_rate: f64,
 
-    #[config(default = 10.0)]
+    #[config(default = 2.0)]
     pub margin: f64,
 
-    #[config(default = 0.2)]
+    #[config(default = 1.0)]
     pub pt_weight: f64,
 
-    #[config(default = 1)]
+    #[config(default = 3)]
     pub k_discrimator_updates: usize,
 }
 
@@ -235,15 +235,12 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
 }
 
 /// Pulling-away loss for EBGAN
-fn pulling_away_loss<B: AutodiffBackend>(embeddings: Tensor<B, 4>) -> Tensor<B, 1> {
-    let [batch_size, d1, d2, d3] = embeddings.dims();
-    let embedding_len = d1 * d2 * d3;
-    let embeddings_flat = embeddings.reshape([batch_size, embedding_len]);
-
+fn pulling_away_loss<B: AutodiffBackend>(embeddings: Tensor<B, 2>) -> Tensor<B, 1> {
+    let [batch_size, _embedding_len] = embeddings.dims();
     // Normalize embeddings
-    let norm = embeddings_flat.clone().powf_scalar(2.0).sum_dim(1).sqrt();
+    let norm = embeddings.clone().powf_scalar(2.0).sum_dim(1).sqrt();
     let norm = norm.reshape([batch_size, 1]);
-    let normalized_embeddings = embeddings_flat.div(norm);
+    let normalized_embeddings = embeddings.div(norm);
 
     // Calculate cosine similarity matrix
     let similarity = normalized_embeddings
